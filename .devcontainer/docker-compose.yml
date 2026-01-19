@@ -20,28 +20,28 @@ x-common:
   user: "Elaina"
   stdin_open: true
 services:
-  ros2driver-service:
+  driverLogic-service:
     # build:
     #   context: ..
     #   dockerfile: .devcontainer/Dockerfile
-    image: elainasuki/rc2026:ros2_driver
-    container_name: ros2driver_container_dev
+    image: elainasuki/rc2026:driverLogic
+    container_name: driverLogic_container_dev
     <<: *common
     volumes:
-      - ros2_driver_volume:/home/Elaina/ros2_driver
+      - driverLogic_volume:/home/Elaina/ros2_ws
       - /var/run/docker.sock:/var/run/docker.sock
       - /dev:/dev
-    working_dir: "/home/Elaina/ros2_driver" # 指定默认工作目录
+    working_dir: "/home/Elaina/ros2_ws" # 指定默认工作目录
     # ros-noetic:
     #   <<: *common
     #   image: elainasuki/ros:ros-noetic-full
     #   container_name: ros-noetic-master
     #   entrypoint: [ "/bin/bash", "-c", "source /opt/ros/noetic/setup.bash && roscore" ]
 volumes:
-  ros2_driver_volume:
+  driverLogic_volume:
     driver: local
     driver_opts:
       type: none # 表示直接绑定本地目录
       device: ./.. # 对应原 ./..（当前 Compose 所在目录的上一级）
       o: bind # 启用绑定模式，保证双向同步
-    name: ros2_driver_volume
+    name: driverLogic_volume
