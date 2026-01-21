@@ -29,11 +29,11 @@ class SmartBagRecorder(Node):
         ])
 
         # 参数解析
-        self.max_size_bytes = int(self.get_parameter('max_size_gb').value * 1024 ** 3)
-        self.max_folder_num = self.get_parameter('max_folder_num').value
-        self.topic_blacklist = self.get_parameter('topic_blacklist').value
+        self.max_size_bytes:int = int((self.get_parameter('max_size_gb').value or 0)* 1024 ** 3)
+        self.max_folder_num = self.get_parameter('max_folder_num').value or 4
+        self.topic_blacklist: list[str] = self.get_parameter('topic_blacklist').value or []
         self.record_dir_root = os.path.abspath(os.path.join(
-            os.path.expanduser('~'), "ros2_driver/rosbag_record"))
+            os.path.expanduser('~'), "ros2_ws/rosbag_record"))
         self.bag_path = self.prepare_record_path()
         print(f'\033[95m📁 Recording to: {self.bag_path}\033[0m')
 
@@ -53,6 +53,7 @@ class SmartBagRecorder(Node):
         # 初始化变量
         self.subscribers = []
         self.subscribed_topics = set()
+        self.blacklisted_topics_checked = set()  # 记录已检查过的黑名单话题
         # 预处理黑名单规则（转换为匹配函数）
         self.blacklist_rules = [self._compile_rule(rule) for rule in self.topic_blacklist]
 
@@ -153,9 +154,13 @@ class SmartBagRecorder(Node):
             return
 
         # 检查是否在黑名单中
+        if topic_name in self.blacklisted_topics_checked:
+            return
+
         for matcher in self.blacklist_rules:
             if matcher(topic_name):
                 print(f'\033[93m🔇 Skipping blacklisted topic: {topic_name}\033[0m')
+                self.blacklisted_topics_checked.add(topic_name)
                 return
 
         try:
