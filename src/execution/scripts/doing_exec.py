@@ -10,31 +10,68 @@ from rclpy.time import Time
 import tf2_ros
 import math
 from typing import Optional
-from task_list.exec_list import ExecListNode
+from task_list.exec_order import ExecListNode
 
 class DoingExec(Node):
     def __init__(self,exec_list_node: ExecListNode):
         super().__init__('doing_exec')
+        self.declare_parameter('error_value_xy', 0.1)
+        self.declare_parameter('error_value_yaw', 0.1)
+        error_xy = self.get_parameter('error_value_xy').value
+        error_yaw = self.get_parameter('error_value_yaw').value
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.control_pub = self.create_publisher(String, 'control', 10)
-        self.robot_site_pub = self.create_publisher(String, 'robot_site', 10)
+        self.location_pub = self.create_publisher(String, 'location', 10)
+        self.exec_callback_sub = self.create_subscription(String, 'exec_callback', self.exec_callback, 10)
         self.exec_list = exec_list_node
-        self.pose_queue = asyncio.Queue()
+        #self.pose_queue = asyncio.Queue()
+        self.move_event = asyncio.Event()
+        self.turn_event = asyncio.Event()
+        self.doing_event = asyncio.Event()
+        self.doing_event.set() # 初始状态为可以执行
+        self.new_pose_xy = None
+        self.new_pose_yaw = None
+        self.callback_queue = asyncio.Queue()
         self.last_stamp = None
         self.moving = False
-        self.target = None
         self.turning = False
         self.last_yaw = None
-        self.timer = self.create_timer(0.1, self.tf_update)
-    def doing_exec(self, task_list: List[str]):
-        func = getattr(, None)
+        self.timer = self.create_timer(0.1, self.tf_update_wrapper)
+    async def doing_exec(self):
+        for item in self.exec_list.R2place1_exec_list:
+            await self.doing_event.wait()
+            self.doing_event.clear()
+            cmd = item[0]
+            args = item[1:]
+            if hasattr(self, cmd):
+                func = getattr(self, cmd)
+                await func(*args)
+            else:
+                msg = String()
+                msg.data = json.dumps({
+                    "topic_name": cmd,
+                    "data": args
+                })
+                self.control_pub.publish(msg)
+                while True:
+                    callback = await self.callback_queue.get()
+                    if callback == cmd:
+                        self.doing_event.set()
+                        break
+                    elif callback == "Unknown frame":
+                        self.get_logger().warn(f"未知返回: {callback}")
+                    elif callback == "cmd_vel":
+                        self.get_logger().info(f"奇怪的返回: {callback}")
+    def exec_callback(self, msg):
+        self.callback_queue.put_nowait(msg.data)
     async def move(self, x, y):
         self.get_logger().info(f"Start move to {x}, {y}")
-        self.target = (x, y)
         self.moving = True
         while True:
-            current_x, current_y = await self.pose_queue.get()
+            await self.move_event.wait()
+            self.move_event.clear()
+            current_x, current_y = self.new_pose_xy
             dx = x - current_x
             dy = y - current_y
             dist = math.sqrt(dx * dx + dy * dy)
@@ -45,18 +82,20 @@ class DoingExec(Node):
                 "data": [dx,dy,self.last_yaw],
             })
             self.control_pub.publish(msg)
-            if dist < 0.1:
+            if dist < self.error_value_xy:
                 self.get_logger().info("结束移动")
                 break
         self.moving = False
+        self.doing_event.set()
     async def turn(self, yaw):
         self.get_logger().info(f"Start turn to {yaw}")
-        self.target = yaw
         self.last_yaw = yaw
         self.turning = True
         while True:
-            current_yaw = await self.pose_queue.get()
-            dyaw = yaw - current_yaw
+            await self.turn_event.wait()
+            self.turn_event.clear()
+            current_yaw = self.new_pose_yaw
+            dyaw = math.atan2(math.sin(yaw - current_yaw), math.cos(yaw - current_yaw))
             self.get_logger().info(f"旋转偏差值: {dyaw}")
             msg = String()
             msg.data = json.dumps({
@@ -64,19 +103,14 @@ class DoingExec(Node):
                 "data": [0, 0, dyaw],
             })
             self.control_pub.publish(msg)
-            if abs(dyaw) < 0.1:
+            if abs(dyaw) < self.error_value_yaw:
                 self.get_logger().info("结束转动")
                 break
         self.turning = False
-    async def others(self, topic ,arg):
-        self.get_logger().info(f"Start {topic}")
-        msg = String()
-        msg.data = json.dumps({
-            "topic_name": topic,
-            "data": arg
-        })
-        self.control_pub.publish(msg)
-    def tf_update(self):#这一部分采用了轮询，可能会出现更新幅度频率不稳定的情况，以后再改
+        self.doing_event.set()
+    def tf_update_wrapper(self):
+        asyncio.create_task(self.tf_update())
+    async def tf_update(self):#这一部分采用了轮询，可能会出现更新幅度频率不稳定的情况，以后再改
         tf_msg = self.read_base_to_map_tf()
         if tf_msg is None:
             return 
@@ -86,14 +120,17 @@ class DoingExec(Node):
         x = tf_msg.transform.translation.x
         y = tf_msg.transform.translation.y
         yaw = self.quaternion_to_yaw(tf_msg.transform.rotation)
+        if x == None or y == None or yaw == None:
+            self.get_logger().warn(f"无效的 TF 值: x={x}, y={y}, yaw={yaw}")
+            return
         # 只在 move/turn运行时才推送
         if self.moving:
-            if self.pose_queue.empty():
-                asyncio.create_task(self.pose_queue.put((x, y)))
+            self.new_pose_xy = (x, y)
+            self.move_event.set()
         if self.turning:
-            if self.pose_queue.empty():
-                asyncio.create_task(self.pose_queue.put(yaw))
-        self.robot_site_pub.publish(String(data=json.dumps([x, y, yaw])))
+            self.new_pose_yaw = yaw
+            self.turn_event.set()
+        self.location_pub.publish(String(data=json.dumps([x, y, yaw])))
     def quaternion_to_yaw(self, q):
         x = q.x
         y = q.y
@@ -113,30 +150,56 @@ class DoingExec(Node):
             return tf_msg
         except tf2_ros.TransformException:
             return None
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = DoingExec()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
 def main():
+    """
+    程序启动入口
+
+    设计说明：
+    1. rclpy 使用自己的事件循环（executor）
+    2. doing_exec 是 asyncio 协程，需要 asyncio 事件循环
+    3. 因此我们使用：
+         - asyncio 作为主循环
+         - rclpy.spin 放入线程执行
+    这样可以保证：
+         - ROS2 回调正常执行
+         - asyncio 协程正常运行
+    """
+
+    # 初始化 ROS2
     rclpy.init()
-    node = DoingExec()
+
+    # 创建执行列表节点（你的任务来源）
+    exec_list_node = ExecListNode()
+
+    # 创建执行节点
+    doing_exec_node = DoingExec(exec_list_node)
+
+    # 获取 asyncio 事件循环
     loop = asyncio.get_event_loop()
-    async def ros_spin():
-        while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.1)
-            await asyncio.sleep(0)
 
-    async def main_task():
-        await node.move(2.0, 3.0)
+    try:
+        # 把 rclpy.spin 放入线程池执行
+        # 这样 ROS 的回调不会阻塞 asyncio
+        loop.run_in_executor(
+            None,               # 使用默认线程池
+            rclpy.spin,         # 在线程中运行 spin
+            doing_exec_node     # 传入节点
+        )
 
-    loop.create_task(ros_spin())
-    loop.create_task(main_task())
+        # 在 asyncio 主循环中运行行为调度协程
+        loop.run_until_complete(
+            doing_exec_node.doing_exec()
+        )
 
-    loop.run_forever()
+    except KeyboardInterrupt:
+        # Ctrl+C 时安全退出
+        pass
+
+    finally:
+        doing_exec_node.destroy_node()
+        exec_list_node.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
-'''我希望通过检测tf树某个节点的更新情况，将新的数据更新到asynico队列里面，然后在move函数中提取这个队列中的新数据，通过与move预先输入的目标数据作比较来判断树否完成move任务'''
